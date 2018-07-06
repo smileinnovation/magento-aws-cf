@@ -1,0 +1,5 @@
+[template]
+src = "php-xdebug.ini.tmpl"
+dest = "/usr/local/etc/php/conf.d/zz-xdebug-settings.ini"
+owner = "magento"
+mode = "0644"

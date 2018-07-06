@@ -1,0 +1,32 @@
+{{ $timezone := or (getenv "TIMEZONE") "Europe/Paris" }}
+{{ $php_memory_limit := or (getenv "PHP_MEMORY_LIMIT") "2G" }}
+{{ $run_mode := or (getenv "MAGENTO_RUN_MODE") "production" }}
+; This file is created automatically by the docker build
+
+; Set the default time zone to silence warnings
+date.timezone={{ $timezone }}
+
+memory_limit = {{ $php_memory_limit }} ; Variable: PHP_MEMORY_LIMIT
+max_execution_time = 600
+upload_max_filesize=256M
+post_max_size=256M
+
+; Opcache settings for Magento
+{{ if eq $run_mode "production" }}
+opcache.enable=1
+{{ else }}
+opcache.enable=0
+{{ end }}
+opcache.enable_cli=1
+opcache.memory_consumption=256
+opcache.max_accelerated_files=130986
+opcache.revalidate_freq=2
+opcache.interned_strings_buffer=12
+opcache.validate_timestamps=0
+opcache.save_comments=1
+opcache.load_comments=0
+opcache.fast_shutdown=1
+opcache.enable_file_override=1
+opcache.blacklist_filename=/var/www/html/opcache*.blacklist
+opcache.error_log=
+opcache.log_verbosity_level=1

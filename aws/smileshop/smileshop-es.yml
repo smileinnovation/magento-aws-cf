@@ -1,0 +1,330 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: A stack that deploy a ElasticSearch cluster as an ECS service
+
+Parameters:
+
+  ShowRoomVPCStackName:
+    Type: String
+    Default: showroom-network
+    Description: The name of the stack used to create VPC and subnet resources
+  ShowRoomECSStackName:
+    Type: String
+    Default: showroom-ecs
+    Description: The name of the stack used to create ECS
+  SmileShopDataStackName:
+    Type: String
+    Default: smileshop-data
+    Description: The name of the stack used to create smileshop persistence resources (EFS/RDS)
+  ESTcpPort:
+    Type: Number
+    Default: '9200'
+    Description: TCP port exposed by the load balancer
+  KeyName:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the ECS instances
+    Default: Showroom
+    AllowedPattern: ".+"
+  DesiredCapacity:
+    Type: Number
+    Default: '1'
+    Description: Number of instances to launch
+  AsgMaxSize:
+    Type: Number
+    Default: '3'
+    Description: Maximum number of instances that can be launched
+  InstanceType:
+    Description: The EC2 instance type
+    Type: String
+    Default: t2.medium
+    AllowedValues:
+      - t2.small
+      - t2.medium
+      - t2.large
+      - t2.xlarge
+      - t2.2xlarge
+      - m4.2xlarge
+      - m5.xlarge
+      - m5.2xlarge
+    Description: Instance type
+  ElasticSearchMemory:
+    Type: Number
+    Default: 3584
+    Description: Memory allocated to ElasticSearch
+
+Mappings:
+  AWSRegionToAMI:
+    us-east-1:
+      AMIID: ami-5253c32d
+    us-east-2:
+      AMIID: ami-956e52f0
+    us-west-2:
+      AMIID: ami-d2f489aa
+    eu-west-1:
+      AMIID: ami-6b81980b
+    eu-central-1:
+      AMIID: ami-10e6c8fb
+    ap-southeast-2:
+      AMIID: ami-bc04d5de
+
+Resources:
+
+  # 1) Security group for ElasticSearch containers
+  ESContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the EC2 containers
+      VpcId:
+        'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-VPC'
+      SecurityGroupIngress:
+         - IpProtocol: tcp
+           FromPort: '22'
+           ToPort: '22'
+           CidrIp: 0.0.0.0/0
+
+  EcsSecurityGroupIngressFromPublicALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from the internal ALB
+      GroupId: !Ref 'ESContainerSecurityGroup'
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref 'InternalLoadBalancerSG'
+
+  EcsSecurityGroupIngressFromSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from other containers in the same security group
+      GroupId: !Ref 'ESContainerSecurityGroup'
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref 'ESContainerSecurityGroup'
+
+  InternalLoadBalancerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the internal facing load balancer
+      VpcId:
+        'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-VPC'
+
+  InternalLoadBalancerSGIngressFromMagentoNode:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from other containers in the same security group
+      GroupId: !Ref 'InternalLoadBalancerSG'
+      IpProtocol: -1
+      SourceSecurityGroupId:
+        'Fn::ImportValue': !Sub '${SmileShopDataStackName}-SmileShopContainersSG'
+
+  # 2) Internal load balancer
+  InternalLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Join ['-', [!Ref 'AWS::StackName', 'elb']]
+      Scheme: internal
+      LoadBalancerAttributes:
+      - Key: idle_timeout.timeout_seconds
+        Value: '30'
+      Subnets:
+        - 'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-PrivateSubnet1'
+        - 'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-PrivateSubnet2'
+        - 'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-PrivateSubnet3'
+      SecurityGroups: [!Ref 'InternalLoadBalancerSG']
+
+  InternalLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - InternalLoadBalancer
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref 'ESInstanceTargetGroup'
+          Type: 'forward'
+      LoadBalancerArn: !Ref 'InternalLoadBalancer'
+      Port: !Ref 'ESTcpPort'
+      Protocol: HTTP
+
+  ESInstanceTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /_cat/health
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+      TargetType: instance
+      Name: !Sub '${AWS::StackName}'
+      Port: 9200
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId:
+        'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-VPC'
+
+  ECSALBListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+      - Type: forward
+        TargetGroupArn: !Ref 'ESInstanceTargetGroup'
+      Conditions:
+      - Field: path-pattern
+        Values: ["*"]
+      ListenerArn: !Ref 'InternalLoadBalancerListener'
+      Priority: 1
+
+  # 3) Auto-scaling rules
+  ESAutoScalingGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      AvailabilityZones:
+        - !Select
+          - '0'
+          - !GetAZs
+            Ref: 'AWS::Region'
+        - !Select
+          - '1'
+          - !GetAZs
+            Ref: 'AWS::Region'
+        - !Select
+          - '2'
+          - !GetAZs
+            Ref: 'AWS::Region'
+      VPCZoneIdentifier:
+        - 'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-PrivateSubnet1'
+        - 'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-PrivateSubnet2'
+        - 'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-PrivateSubnet3'
+      LaunchConfigurationName: !Ref ESContainerInstances
+      MinSize: '1'
+      MaxSize: !Ref AsgMaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      Tags:
+      - PropagateAtLaunch: true
+        Key: Name
+        Value: !Sub '${AWS::StackName}'
+      - PropagateAtLaunch: true
+        Key: !Sub '${AWS::StackName}-cluster'
+        Value: '1'
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: '1'
+        MaxBatchSize: '1'
+        PauseTime: PT15M
+        WaitOnResourceSignals: 'true'
+
+  ESContainerInstances:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !FindInMap [AWSRegionToAMI, !Ref 'AWS::Region', AMIID]
+      SecurityGroups: [!Ref 'ESContainerSecurityGroup']
+      InstanceType: !Ref 'InstanceType'
+      IamInstanceProfile:
+        'Fn::ImportValue': !Sub '${ShowRoomECSStackName}-EC2InstanceProfile'
+      KeyName: !Ref 'KeyName'
+      UserData:
+        Fn::Base64: !Sub
+        - |
+          #!/bin/bash -xe
+          trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource ESAutoScalingGroup --region ${AWS::Region}' ERR
+          echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+          yum install -y aws-cfn-bootstrap
+          # up the vm.max_map_count for elasticsearch
+          echo vm.max_map_count=262144 >> /etc/sysctl.conf
+          sysctl -w vm.max_map_count=262144
+          /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource ESAutoScalingGroup --region ${AWS::Region}
+        -
+          ECSCluster:
+            'Fn::ImportValue': !Sub '${ShowRoomECSStackName}-ECSClusterName'
+
+  # 4) ECS Service and Task definition
+  ECSService:
+    Type: 'AWS::ECS::Service'
+    DependsOn:
+      - ESAutoScalingGroup
+      - InternalLoadBalancerListener
+    Properties:
+      ServiceName: !Sub '${AWS::StackName}'
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+      Cluster:
+        'Fn::ImportValue': !Sub '${ShowRoomECSStackName}-ECSClusterName'
+      DesiredCount: !Ref 'DesiredCapacity'
+      LaunchType: EC2
+      LoadBalancers:
+        - ContainerName: elasticsearch
+          ContainerPort: '9200'
+          TargetGroupArn: !Ref 'ESInstanceTargetGroup'
+      Role:
+        'Fn::ImportValue': !Sub '${ShowRoomECSStackName}-ECSRole'
+      TaskDefinition: !Ref TaskDefinition
+
+  TaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      Family: 'smileshop-es'
+      ContainerDefinitions:
+        - Name: elasticsearch
+          Image: 274275471339.dkr.ecr.us-east-1.amazonaws.com/smile-innovation/showroom/magento-elasticsearch-aws
+          Essential: true
+          Memory: !Ref 'ElasticSearchMemory'
+          Command:
+            - "elasticsearch"
+            - "-Elogger.level=DEBUG"
+          PortMappings:
+            - HostPort: 9200
+              ContainerPort: 9200
+            - HostPort: 9300
+              ContainerPort: 9300
+          Environment:
+            -
+              Name: 'cluster.name'
+              Value: !Sub '${AWS::StackName}-cluster'
+            -
+              Name: 'bootstrap.memory_lock'
+              Value: 'true'
+            -
+              Name: 'ES_JAVA_OPTS'
+              Value: '-Xms3072m -Xmx3072m'
+            -
+              Name: 'xpack.security.enabled'
+              Value: 'false'
+            -
+              Name: 'CLUSTER_SG'
+              Value: !Ref 'ESContainerSecurityGroup'
+            -
+              Name: 'EC2_TAG_NAME'
+              Value: !Sub '${AWS::StackName}-cluster'
+            -
+              Name: 'EC2_TAG_VALUE'
+              Value: '1'
+          Ulimits:
+            -
+              HardLimit: -1
+              Name: 'memlock'
+              SoftLimit: -1
+            -
+              HardLimit: 65536
+              Name: 'nofile'
+              SoftLimit: 65536
+#          MountPoints:
+#            - ContainerPath: /usr/share/elasticsearch/data/
+#              SourceVolume: esdata
+          LogConfiguration:
+            LogDriver: 'awslogs'
+            Options:
+              awslogs-group:
+                'Fn::ImportValue': !Sub '${SmileShopDataStackName}-LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: 'smileshop-es'
+#      Volumes:
+#        - Host:
+#            SourcePath: /ecs/esdata
+#          Name: esdata
+
+Outputs:
+  ElasticSearchEndPoint:
+    Description: The url of the external load balancer
+    Value: !Sub '${InternalLoadBalancer.DNSName}:${ESTcpPort}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ElasticSearchEndPoint'

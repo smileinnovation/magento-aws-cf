@@ -1,0 +1,35 @@
+{{ $run_mode := or (getenv "MAGENTO_RUN_MODE") "production" }}
+; This file is created automatically by the docker build
+
+[global]
+
+error_log = /proc/self/fd/2
+daemonize = no
+
+[www]
+
+; if we send this to /proc/self/fd/1, it never appears
+access.log = /proc/self/fd/2
+
+; useless if php-fpm run as a non-root user
+; user = magento
+; group = www-data
+
+; listen = [::]:9000
+listen = /var/run/php-fpm.sock
+listen.owner = magento
+listen.group = root
+listen.mode=0660
+
+pm = static
+pm.max_children = 20
+pm.process_idle_timeout = 10s
+pm.max_requests = 200
+request_terminate_timeout = 600s
+
+env[MAGE_MODE] = {{ $run_mode }}; # Variable: MAGENTO_RUN_MODE
+
+clear_env = no
+
+; Ensure worker stdout and stderr are sent to the main error log.
+catch_workers_output = yes

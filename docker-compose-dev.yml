@@ -1,0 +1,96 @@
+version: '3'
+
+services:
+  mysql :
+    image: mysql:5.7
+    command: --max_allowed_packet=32505856
+    ports:
+      - 3306:3306
+    environment:
+      - MYSQL_RANDOM_ROOT_PASSWORD=yes
+      - MYSQL_DATABASE=magento
+      - MYSQL_USER=magento
+      - MYSQL_PASSWORD=magento
+    volumes:
+      - mysql:/var/lib/mysql
+      - ./data/dev/db:/docker-entrypoint-initdb.d
+
+  elasticsearch:
+    image: magento-elasticsearch
+    environment:
+      - cluster.name=docker-cluster
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - 9200:9200
+    healthcheck:
+      test: ["CMD", "curl", "-fsSL", "-u", "elastic:changeme", "http://localhost:9200/_cat/health?h=status"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - es:/usr/share/elasticsearch/data
+
+  redis:
+    image: redis:3
+    ports:
+      - 6379:6379
+    volumes:
+      - redis:/data:delegated
+
+  magento:
+    image: magento-node
+    user: ${CURRENT_UID}
+    ports:
+      - 80:8080
+    depends_on:
+      - mysql
+      - elasticsearch
+      - redis
+    environment:
+      - FQDN=localhost
+      - USE_SSL=false
+      - UNATTENDED=true
+      - DEBUG=false
+      - PHP_MEMORY_LIMIT=4G
+      - PHP_ENABLE_XDEBUG=false
+      - MAGENTO_ROOT=/var/www/magento
+      - MAGENTO_RUN_MODE=developer
+      - UPLOAD_MAX_FILESIZE=64M
+      - MYSQL_HOSTNAME=mysql
+      - MYSQL_USERNAME=magento
+      - MYSQL_PASSWORD=magento
+      - MYSQL_DATABASE=magento
+      - ES_HOST=elasticsearch:9200
+      - ES_USER=elastic
+      - ES_PASSWORD=changeme
+      - ES_ENABLE_SSL=false
+      - CRYPT_KEY=""
+      - USE_REDIS=false
+      - REDIS_SERVER=redis
+      - REDIS_PORT=6379
+      - REDIS_SESSION_DB=0
+      - REDIS_CACHE_BACKEND_DB=1
+      - REDIS_PAGE_CACHE_DB=2
+      - ADMIN_USERNAME=admin
+      - ADMIN_PASSWORD=adm1nistrator
+      - ADMIN_FIRSTNAME=admin
+      - ADMIN_LASTNAME=admin
+      - ADMIN_EMAIL=admin@localhost.com
+      - CURRENCY=EUR
+      - LANGUAGE=fr_FR
+      - TIMEZONE=Europe/Paris
+      - BACKEND_FRONTNAME=admin
+      - CONTENT_LANGUAGES=fr_FR
+    volumes:
+      - ./data/dev/magento22-paas:/var/www/magento
+      - ./data/dev/media/catalog:/var/www/magento/pub/media/catalog
+
+volumes:
+  es:
+  mysql:
+  redis:

@@ -1,0 +1,826 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: A stack that deploy magento nodes as an ECS service
+
+Parameters:
+
+  ShowRoomVPCStackName:
+    Type: String
+    Default: showroom-network
+    Description: The name of the stack used to create VPC and subnet resources
+  ShowRoomECSStackName:
+    Type: String
+    Default: showroom-ecs
+    Description: The name of the stack used to create ECS
+  SmileShopDataStackName:
+    Type: String
+    Default: smileshop-data
+    Description: The name of the stack used to create smileshop persistence resources (EFS/RDS)
+  SmileShopESStackName:
+    Type: String
+    Default: smileshop-es
+    Description: The name of the stack userd to create the ElasticSearch cluster
+  KeyName:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the ECS instances
+    Default: Showroom
+    AllowedPattern: ".+"
+  DesiredCapacity:
+    Type: Number
+    Default: '1'
+    Description: Number of instances to launch
+  AsgMaxSize:
+    Type: Number
+    Default: '3'
+    Description: Maximum number of instances that can be launched
+  InstanceType:
+    Description: The EC2 instance type
+    Type: String
+    Default: t2.medium
+    AllowedValues:
+      - t2.small
+      - t2.medium
+      - t2.large
+      - t2.xlarge
+      - t2.2xlarge
+      - m4.2xlarge
+      - m5.xlarge
+      - m5.2xlarge
+    Description: Instance type for PHPFPM Node
+  CronInstanceType:
+    Description: The EC2 instance type
+    Type: String
+    Default: t2.small
+    AllowedValues:
+      - t2.small
+      - t2.medium
+      - t2.large
+      - t2.xlarge
+      - t2.2xlarge
+      - m4.2xlarge
+      - m5.xlarge
+      - m5.2xlarge
+    Description: Instance type for Cron job
+  MagentoNodeMemory:
+    Type: Number
+    Default: 3584
+    Description: Memory allocated to Magento Node
+  MagentoCronNodeMemory:
+    Type: Number
+    Default: 1792
+    Description: Memory allocated to Magento Node
+  PHPFpmMemory:
+    Type: String
+    Default: '3G'
+    Description: Memory allocated to Php FPM process, must be lower than container memory
+  MagentoFQDN:
+    Type: String
+    Default: 'smileshop.hubinnov.org'
+    Description: Magento fully qualified domain name (hostname, without HTTP/HTTPS !!!)
+  MagentoProtocol:
+    Description: Magento protocol, either http or https
+    Default: https
+    Type: String
+    AllowedValues: [http, https]
+  HostedZoneId:
+    Description: Route53 zone Id for DNS record set update
+    Type: String
+    Default: 'ZHCOSGSAQ3K9J'
+  CertificateARN:
+    Description: AWS Certificate ARN
+    Default: 'arn:aws:acm:us-east-1:274275471339:certificate/70629d44-d974-428f-97e8-e88e7c6d3303'
+    Type: String
+  MagentoAdminPassword:
+    Description: Magento admin password
+    Type: String
+    Default: adm1nistrator
+  MagentoDBPassword:
+    Description: 'Magento DB password'
+    Type: String
+    Default: 'Magento*00'
+
+Mappings:
+  AWSRegionToAMI:
+    us-east-1:
+      AMIID: ami-5253c32d
+    us-east-2:
+      AMIID: ami-956e52f0
+    us-west-2:
+      AMIID: ami-d2f489aa
+    eu-west-1:
+      AMIID: ami-6b81980b
+    eu-central-1:
+      AMIID: ami-10e6c8fb
+    ap-southeast-2:
+      AMIID: ami-bc04d5de
+
+Conditions:
+  InSSL: !And
+    - !Not [!Equals [!Ref CertificateARN, '']]
+    - !Equals [!Ref 'MagentoProtocol', 'https']
+  NotInSSL: !Not [Condition: InSSL]
+
+Resources:
+
+  # 1) Security group for Magento node containers
+  PublicLoadBalancerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the public facing load balancer
+      VpcId:
+        'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-VPC'
+
+  HTTPTraffic:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NotInSSL
+    Properties:
+      GroupId: !Ref 'PublicLoadBalancerSG'
+      IpProtocol: tcp
+      CidrIp: 0.0.0.0/0
+      FromPort: '80'
+      ToPort: '80'
+
+  HTTPSTraffic:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: InSSL
+    Properties:
+      GroupId: !Ref 'PublicLoadBalancerSG'
+      IpProtocol: tcp
+      CidrIp: 0.0.0.0/0
+      FromPort: '443'
+      ToPort: '443'
+
+  SmileShopContainersSecurityGroupSSHAccess:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from other containers in the same security group
+      GroupId:
+        'Fn::ImportValue': !Sub '${SmileShopDataStackName}-SmileShopContainersSG'
+      IpProtocol: tcp
+      CidrIp: 0.0.0.0/0
+      FromPort: '22'
+      ToPort: '22'
+
+  SmileShopContainersSecurityGroupIngressFromPublicALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from the public ALB
+      GroupId:
+        'Fn::ImportValue': !Sub '${SmileShopDataStackName}-SmileShopContainersSG'
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref 'PublicLoadBalancerSG'
+
+  EcsSecurityGroupIngressFromSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from other containers in the same security group
+      GroupId:
+        'Fn::ImportValue': !Sub '${SmileShopDataStackName}-SmileShopContainersSG'
+      IpProtocol: -1
+      SourceSecurityGroupId:
+        'Fn::ImportValue': !Sub '${SmileShopDataStackName}-SmileShopContainersSG'
+
+  # 2) Public load balancer
+  PublicLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Join ['-', [!Ref 'AWS::StackName', 'elb']]
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+      - Key: idle_timeout.timeout_seconds
+        Value: '30'
+      Subnets:
+        - 'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-PublicSubnet1'
+        - 'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-PublicSubnet2'
+        - 'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-PublicSubnet3'
+      SecurityGroups: [!Ref 'PublicLoadBalancerSG']
+
+  PublicLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: NotInSSL
+    DependsOn:
+      - PublicLoadBalancer
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref 'MagentoInstanceTargetGroup'
+          Type: 'forward'
+      LoadBalancerArn: !Ref 'PublicLoadBalancer'
+      Port: 80
+      Protocol: HTTP
+
+  PublicLoadBalancerSSLListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: InSSL
+    DependsOn:
+      - PublicLoadBalancer
+    Properties:
+      Certificates:
+        - CertificateArn: !Ref 'CertificateARN'
+      DefaultActions:
+        - TargetGroupArn: !Ref 'MagentoInstanceTargetGroup'
+          Type: 'forward'
+      LoadBalancerArn: !Ref 'PublicLoadBalancer'
+      Port: 443
+      Protocol: HTTPS
+
+  MagentoInstanceTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn:
+      - PublicLoadBalancer
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /_health
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 10
+      Matcher:
+        HttpCode: '200'
+      TargetType: instance
+      Name: !Sub '${AWS::StackName}'
+      Port: 8081
+      Protocol: HTTP
+      VpcId:
+        'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-VPC'
+
+  # 3) Auto-scaling rules
+  MagentoAutoScalingGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      AvailabilityZones:
+        - !Select
+          - '0'
+          - !GetAZs
+            Ref: 'AWS::Region'
+        - !Select
+          - '1'
+          - !GetAZs
+            Ref: 'AWS::Region'
+        - !Select
+          - '2'
+          - !GetAZs
+            Ref: 'AWS::Region'
+      VPCZoneIdentifier:
+        - 'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-PublicSubnet1'
+        - 'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-PublicSubnet2'
+        - 'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-PublicSubnet3'
+      LaunchConfigurationName: !Ref MagentoContainerInstances
+      MinSize: '1'
+      MaxSize: !Ref AsgMaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      Tags:
+      - PropagateAtLaunch: true
+        Value: !Sub '${AWS::StackName}'
+        Key: Name
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: '1'
+        MaxBatchSize: '1'
+        PauseTime: PT10M
+        WaitOnResourceSignals: 'true'
+
+  MagentoContainerInstances:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          Install:
+            - Install
+        Install:
+          packages:
+            yum:
+              nfs-utils: []
+              python27: []
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.VirtualMachine.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init --verbose --stack ${AWS::StackName} --region ${AWS::Region} --resource MagentoAutoScalingGroup
+                runas=root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+    Properties:
+      ImageId: !FindInMap [AWSRegionToAMI, !Ref 'AWS::Region', AMIID]
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile:
+        'Fn::ImportValue': !Sub '${ShowRoomECSStackName}-EC2InstanceProfile'
+      KeyName: !Ref KeyName
+      AssociatePublicIpAddress: true
+      SecurityGroups:
+        - 'Fn::ImportValue': !Sub '${SmileShopDataStackName}-SmileShopContainersSG'
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash -ex
+            trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource MagentoAutoScalingGroup --region ${AWS::Region}' ERR
+            echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+            # up the vm.max_map_count for elasticsearch
+            echo vm.max_map_count=262144 >> /etc/sysctl.conf
+            sysctl -w vm.max_map_count=262144
+            yum install -y aws-cfn-bootstrap
+            /opt/aws/bin/cfn-init --stack ${AWS::StackName} --resource MagentoContainerInstances --configsets Install --region ${AWS::Region}
+            PATH=$PATH:/usr/local/bin
+            EC2_AVAIL_ZONE=`curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone`
+            EC2_REGION=${AWS::Region}
+            mkdir -p /mnt/efs
+            EFS_FILE_SYSTEM_ID=${FileSystemId}
+            DIR_SRC=$EC2_AVAIL_ZONE.$EFS_FILE_SYSTEM_ID.efs.$EC2_REGION.amazonaws.com
+            DIR_TGT=/mnt/efs
+            touch /home/ec2-user/echo.res
+            echo $EFS_FILE_SYSTEM_ID >> /home/ec2-user/echo.res
+            echo $EC2_AVAIL_ZONE >> /home/ec2-user/echo.res
+            echo $EC2_REGION >> /home/ec2-user/echo.res
+            echo $DIR_SRC >> /home/ec2-user/echo.res
+            echo $DIR_TGT >> /home/ec2-user/echo.res
+            mount -t nfs4 $DIR_SRC:/ $DIR_TGT >> /home/ec2-user/echo.res
+            cp -p /etc/fstab /etc/fstab.back-$(date +%F)
+            echo -e $DIR_SRC:/ \t\t $DIR_TGT \t\t nfs \t\t defaults \t\t 0 \t\t 0\ | tee -a /etc/fstab
+            docker ps
+            service docker stop
+            service docker start
+            /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource MagentoAutoScalingGroup --region ${AWS::Region}
+          -
+            ECSCluster:
+              'Fn::ImportValue': !Sub '${ShowRoomECSStackName}-ECSClusterName'
+            FileSystemId:
+              'Fn::ImportValue': !Sub '${SmileShopDataStackName}-FileSystem'
+
+  # 5) Magento Service and Task definition
+  MagentoECSService:
+    Type: 'AWS::ECS::Service'
+    DependsOn:
+      - MagentoAutoScalingGroup
+      - PublicLoadBalancer
+    Properties:
+      ServiceName: !Sub '${AWS::StackName}'
+      Cluster:
+        'Fn::ImportValue': !Sub '${ShowRoomECSStackName}-ECSClusterName'
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+      DesiredCount: !Ref 'DesiredCapacity'
+      LaunchType: EC2
+      LoadBalancers:
+        - ContainerName: smileshop-magento
+          ContainerPort: '8080'
+          TargetGroupArn: !Ref 'MagentoInstanceTargetGroup'
+      Role:
+        'Fn::ImportValue': !Sub '${ShowRoomECSStackName}-ECSRole'
+      TaskDefinition: !Ref MagentoTaskDefinition
+
+  MagentoTaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      Family: 'smileshop-magento'
+      ContainerDefinitions:
+        - Name: smileshop-magento
+          Image: 274275471339.dkr.ecr.us-east-1.amazonaws.com/smile-innovation/showroom/smileshop-magento
+          Essential: true
+          Memory: !Ref 'MagentoNodeMemory'
+          PortMappings:
+            - HostPort: 8080
+              ContainerPort: 8080
+            - HostPort: 8081
+              ContainerPort: 8081
+          Environment:
+            -
+              Name: 'FQDN'
+              Value: !Ref 'MagentoFQDN'
+            -
+              Name: 'USE_SSL'
+              Value: !If [InSSL, 'true', 'false']
+            -
+              Name: 'UNATTENDED'
+              Value: 'true'
+            -
+              Name: 'DEBUG'
+              Value: 'false'
+            -
+              Name: 'PHP_MEMORY_LIMIT'
+              Value: !Ref 'PHPFpmMemory'
+            -
+              Name: 'PHP_ENABLE_XDEBUG'
+              Value: 'false'
+            -
+              Name: 'MAGENTO_ROOT'
+              Value: '/var/www/magento'
+            -
+              Name: 'MAGENTO_RUN_MODE'
+              Value: 'production'
+            -
+              Name: 'UPLOAD_MAX_FILESIZE'
+              Value: '64M'
+            -
+              Name: 'MYSQL_HOSTNAME'
+              Value:
+                'Fn::ImportValue': !Sub '${SmileShopDataStackName}-RDSAddress'
+            -
+              Name: 'MYSQL_USERNAME'
+              Value: 'magento'
+            -
+              Name: 'MYSQL_PASSWORD'
+              Value: !Ref 'MagentoDBPassword'
+            -
+              Name: 'MYSQL_DATABASE'
+              Value: 'magento'
+            -
+              Name: 'ES_HOST'
+              Value:
+                'Fn::ImportValue': !Sub '${SmileShopESStackName}-ElasticSearchEndPoint'
+            -
+              Name: 'ES_USER'
+              Value: ' '
+            -
+              Name: 'ES_PASSWORD'
+              Value: ' '
+            -
+              Name: 'ES_ENABLE_SSL'
+              Value: 'false'
+            -
+              Name: 'CRYPT_KEY'
+              Value: ''
+            -
+              Name: 'USE_REDIS'
+              Value: 'true'
+            -
+              Name: 'REDIS_SERVER'
+              Value:
+                'Fn::ImportValue': !Sub '${SmileShopDataStackName}-RedisEndpoint'
+            -
+              Name: 'REDIS_PORT'
+              Value: '6379'
+            -
+              Name: 'REDIS_SESSION_DB'
+              Value: '0'
+            -
+              Name: 'REDIS_CACHE_BACKEND_DB'
+              Value: '1'
+            -
+              Name: 'REDIS_PAGE_CACHE_DB'
+              Value: '2'
+            -
+              Name: 'ADMIN_USERNAME'
+              Value: 'admin'
+            -
+              Name: 'ADMIN_PASSWORD'
+              Value: !Ref 'MagentoAdminPassword'
+            -
+              Name: 'ADMIN_FIRSTNAME'
+              Value: 'admin'
+            -
+              Name: 'ADMIN_LASTNAME'
+              Value: 'admin'
+            -
+              Name: 'ADMIN_EMAIL'
+              Value: 'admin@localhost.com'
+            -
+              Name: 'CURRENCY'
+              Value: 'EUR'
+            -
+              Name: 'LANGUAGE'
+              Value: 'en_US'
+            -
+              Name: 'TIMEZONE'
+              Value: 'Europe/Paris'
+            -
+              Name: 'BACKEND_FRONTNAME'
+              Value: 'admin'
+            -
+              Name: 'CONTENT_LANGUAGES'
+              Value: 'en_US'
+          MountPoints:
+            - ContainerPath: /var/www/magento/pub/media/catalog
+              SourceVolume: magento-media-catalog
+          LogConfiguration:
+            LogDriver: 'awslogs'
+            Options:
+              awslogs-group:
+                'Fn::ImportValue': !Sub '${SmileShopDataStackName}-LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: 'smileshop-magento'
+      Volumes:
+        - Host:
+            SourcePath: /mnt/efs/catalog
+          Name: magento-media-catalog
+
+  # 6) DNS records
+  MagentoDNSRecord:
+    Type: AWS::Route53::RecordSet
+    DependsOn:
+      - MagentoAutoScalingGroup
+      - PublicLoadBalancer
+    Properties:
+      HostedZoneId: !Ref 'HostedZoneId'
+      Name: !Sub '${MagentoFQDN}.'
+      Type: CNAME
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt 'PublicLoadBalancer.DNSName'
+
+  # 7) Magento CRON
+
+  # 7.1) Cron auto scaling group for 1 VM only
+  MagentoCronAutoScalingGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      AvailabilityZones:
+        - !Select
+          - '0'
+          - !GetAZs
+            Ref: 'AWS::Region'
+        - !Select
+          - '1'
+          - !GetAZs
+            Ref: 'AWS::Region'
+        - !Select
+          - '2'
+          - !GetAZs
+            Ref: 'AWS::Region'
+      VPCZoneIdentifier:
+        - 'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-PublicSubnet1'
+        - 'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-PublicSubnet2'
+        - 'Fn::ImportValue': !Sub '${ShowRoomVPCStackName}-PublicSubnet3'
+      LaunchConfigurationName: !Ref MagentoCronContainerInstances
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: '1'
+      Tags:
+      - PropagateAtLaunch: true
+        Value: !Sub '${AWS::StackName}-cron'
+        Key: Name
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: '1'
+        MaxBatchSize: '1'
+        PauseTime: PT10M
+        WaitOnResourceSignals: 'true'
+
+  MagentoCronContainerInstances:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          Install:
+            - Install
+        Install:
+          packages:
+            yum:
+              nfs-utils: []
+              python27: []
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.VirtualMachine.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init --verbose --stack ${AWS::StackName} --region ${AWS::Region} --resource MagentoCronAutoScalingGroup
+                runas=root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+    Properties:
+      ImageId: !FindInMap [AWSRegionToAMI, !Ref 'AWS::Region', AMIID]
+      InstanceType: !Ref CronInstanceType
+      IamInstanceProfile:
+        'Fn::ImportValue': !Sub '${ShowRoomECSStackName}-EC2InstanceProfile'
+      KeyName: !Ref KeyName
+      AssociatePublicIpAddress: true
+      SecurityGroups:
+        - 'Fn::ImportValue': !Sub '${SmileShopDataStackName}-SmileShopContainersSG'
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash -ex
+            trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource MagentoCronAutoScalingGroup --region ${AWS::Region}' ERR
+            echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+            # up the vm.max_map_count for elasticsearch
+            echo vm.max_map_count=262144 >> /etc/sysctl.conf
+            sysctl -w vm.max_map_count=262144
+            yum install -y aws-cfn-bootstrap
+            /opt/aws/bin/cfn-init --stack ${AWS::StackName} --resource MagentoCronContainerInstances --configsets Install --region ${AWS::Region}
+            PATH=$PATH:/usr/local/bin
+            EC2_AVAIL_ZONE=`curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone`
+            EC2_REGION=${AWS::Region}
+            mkdir -p /mnt/efs
+            EFS_FILE_SYSTEM_ID=${FileSystemId}
+            DIR_SRC=$EC2_AVAIL_ZONE.$EFS_FILE_SYSTEM_ID.efs.$EC2_REGION.amazonaws.com
+            DIR_TGT=/mnt/efs
+            touch /home/ec2-user/echo.res
+            echo $EFS_FILE_SYSTEM_ID >> /home/ec2-user/echo.res
+            echo $EC2_AVAIL_ZONE >> /home/ec2-user/echo.res
+            echo $EC2_REGION >> /home/ec2-user/echo.res
+            echo $DIR_SRC >> /home/ec2-user/echo.res
+            echo $DIR_TGT >> /home/ec2-user/echo.res
+            mount -t nfs4 $DIR_SRC:/ $DIR_TGT >> /home/ec2-user/echo.res
+            cp -p /etc/fstab /etc/fstab.back-$(date +%F)
+            echo -e $DIR_SRC:/ \t\t $DIR_TGT \t\t nfs \t\t defaults \t\t 0 \t\t 0\ | tee -a /etc/fstab
+            docker ps
+            service docker stop
+            service docker start
+            /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource MagentoCronAutoScalingGroup --region ${AWS::Region}
+          -
+            ECSCluster:
+              'Fn::ImportValue': !Sub '${ShowRoomECSStackName}-ECSClusterName'
+            FileSystemId:
+              'Fn::ImportValue': !Sub '${SmileShopDataStackName}-FileSystem'
+
+  # 7.2 ) Magento Cron Service and Task definition
+  MagentoCronECSService:
+    Type: 'AWS::ECS::Service'
+    DependsOn:
+      - MagentoCronAutoScalingGroup
+      - MagentoECSService
+    Properties:
+      ServiceName: !Sub '${AWS::StackName}-cron'
+      Cluster:
+        'Fn::ImportValue': !Sub '${ShowRoomECSStackName}-ECSClusterName'
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+      DesiredCount: '1'
+      LaunchType: EC2
+      TaskDefinition: !Ref CronTaskDefinition
+
+  CronTaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      Family: 'smileshop-magento-cron'
+      ContainerDefinitions:
+        - Name: smileshop-magento-cron
+          Image: 274275471339.dkr.ecr.us-east-1.amazonaws.com/smile-innovation/showroom/smileshop-magento
+          Essential: true
+          Memory: !Ref 'MagentoCronNodeMemory'
+          Environment:
+            -
+              Name: 'CRON'
+              Value: 'true'
+            -
+              Name: 'FQDN'
+              Value: !Ref 'MagentoFQDN'
+            -
+              Name: 'USE_SSL'
+              Value: !If [InSSL, 'true', 'false']
+            -
+              Name: 'UNATTENDED'
+              Value: 'true'
+            -
+              Name: 'DEBUG'
+              Value: 'false'
+            -
+              Name: 'PHP_MEMORY_LIMIT'
+              Value: '1536M'
+            -
+              Name: 'PHP_ENABLE_XDEBUG'
+              Value: 'false'
+            -
+              Name: 'MAGENTO_ROOT'
+              Value: '/var/www/magento'
+            -
+              Name: 'MAGENTO_RUN_MODE'
+              Value: 'production'
+            -
+              Name: 'UPLOAD_MAX_FILESIZE'
+              Value: '64M'
+            -
+              Name: 'MYSQL_HOSTNAME'
+              Value:
+                'Fn::ImportValue': !Sub '${SmileShopDataStackName}-RDSAddress'
+            -
+              Name: 'MYSQL_USERNAME'
+              Value: 'magento'
+            -
+              Name: 'MYSQL_PASSWORD'
+              Value: !Ref 'MagentoDBPassword'
+            -
+              Name: 'MYSQL_DATABASE'
+              Value: 'magento'
+            -
+              Name: 'ES_HOST'
+              Value:
+                'Fn::ImportValue': !Sub '${SmileShopESStackName}-ElasticSearchEndPoint'
+            -
+              Name: 'ES_USER'
+              Value: ''
+            -
+              Name: 'ES_PASSWORD'
+              Value: ''
+            -
+              Name: 'ES_ENABLE_SSL'
+              Value: 'false'
+            -
+              Name: 'CRYPT_KEY'
+              Value: ''
+            -
+              Name: 'USE_REDIS'
+              Value: 'true'
+            -
+              Name: 'REDIS_SERVER'
+              Value:
+                'Fn::ImportValue': !Sub '${SmileShopDataStackName}-RedisEndpoint'
+            -
+              Name: 'REDIS_PORT'
+              Value: '6379'
+            -
+              Name: 'REDIS_SESSION_DB'
+              Value: '0'
+            -
+              Name: 'REDIS_CACHE_BACKEND_DB'
+              Value: '1'
+            -
+              Name: 'REDIS_PAGE_CACHE_DB'
+              Value: '2'
+            -
+              Name: 'ADMIN_USERNAME'
+              Value: 'admin'
+            -
+              Name: 'ADMIN_PASSWORD'
+              Value: !Ref 'MagentoAdminPassword'
+            -
+              Name: 'ADMIN_FIRSTNAME'
+              Value: 'admin'
+            -
+              Name: 'ADMIN_LASTNAME'
+              Value: 'admin'
+            -
+              Name: 'ADMIN_EMAIL'
+              Value: 'admin@localhost.com'
+            -
+              Name: 'CURRENCY'
+              Value: 'EUR'
+            -
+              Name: 'LANGUAGE'
+              Value: 'en_US'
+            -
+              Name: 'TIMEZONE'
+              Value: 'Europe/Paris'
+            -
+              Name: 'BACKEND_FRONTNAME'
+              Value: 'admin'
+            -
+              Name: 'CONTENT_LANGUAGES'
+              Value: 'en_US'
+          MountPoints:
+            - ContainerPath: /var/www/magento/pub/media/catalog
+              SourceVolume: magento-media-catalog
+          LogConfiguration:
+            LogDriver: 'awslogs'
+            Options:
+              awslogs-group:
+                'Fn::ImportValue': !Sub '${SmileShopDataStackName}-LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: 'smileshop-magento-cron'
+      Volumes:
+        - Host:
+            SourcePath: /mnt/efs/catalog
+          Name: magento-media-catalog
+
+Outputs:
+  ELBEndPoint:
+    Description: The url of the external load balancer
+    Value: !GetAtt 'PublicLoadBalancer.DNSName'
+    Export:
+      Name: !Sub '${AWS::StackName}-ELBEndPoint'
+  MagentoEndPoint:
+    Description: Magento URL
+    Value: !Sub '${MagentoProtocol}://${MagentoFQDN}'
+    Export:
+      Name: !Sub '${AWS::StackName}-MagentoEndPoint'
+  MagentoFQDN:
+    Description: Magento FQDN
+    Value: !Ref 'MagentoFQDN'
+    Export:
+      Name: !Sub '${AWS::StackName}-MagentoFQDN'

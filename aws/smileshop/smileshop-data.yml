@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: A stack that deploy persistence service for the SmileShop
+
+Parameters:
+  VPCStackName:
+    Type: String
+    Default: showroom-network
+    Description: vpc stackname
+  EFSNameTag:
+    Description: The name of the EFS volume
+    Type: String
+    MinLength: '1'
+    Default: smileshop-media
+  LogGroupName:
+    Description: The log group name
+    Type: String
+    MinLength: '1'
+    Default: smileshop
+  LogsRetentionInDays:
+    Description: 'Specifies the number of days you want to retain log events in the specified log group.'
+    Type: Number
+    Default: 14
+  MagentoDBPassword:
+    Description: 'Magento DB password'
+    Type: String
+    Default: 'Password*00'
+
+Resources:
+
+  # 1) Security groups
+  SmileShopContainersSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the EC2 containers
+      VpcId:
+        'Fn::ImportValue': !Sub '${VPCStackName}-VPC'
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to EFS volume
+      VpcId:
+        'Fn::ImportValue': !Sub '${VPCStackName}-VPC'
+  EFSSecurityGroupIngressFromECS:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from EC2 containers
+      GroupId: !Ref 'EFSSecurityGroup'
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref 'SmileShopContainersSecurityGroup'
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Open database for access
+      VpcId:
+        'Fn::ImportValue': !Sub '${VPCStackName}-VPC'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '3306'
+          ToPort: '3306'
+          SourceSecurityGroupId: !Ref 'SmileShopContainersSecurityGroup'
+  RDSDBSecurityGroup:
+    Type: AWS::RDS::DBSecurityGroup
+    Properties:
+      EC2VpcId:
+        'Fn::ImportValue': !Sub '${VPCStackName}-VPC'
+      DBSecurityGroupIngress:
+        EC2SecurityGroupId: !Ref 'SmileShopContainersSecurityGroup'
+      GroupDescription: database access
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Redis Security Group"
+      VpcId:
+        'Fn::ImportValue': !Sub '${VPCStackName}-VPC'
+  RedisIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from smileshop containers
+      GroupId: !Ref 'RedisSecurityGroup'
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref 'SmileShopContainersSecurityGroup'
+
+  # 2) EFS
+  FileSystem:
+    Type: 'AWS::EFS::FileSystem'
+    Properties:
+      FileSystemTags:
+        - Key: Name
+          Value: !Ref EFSNameTag
+  MountTarget:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId:
+        'Fn::ImportValue': !Sub '${VPCStackName}-PublicSubnet1'
+      SecurityGroups: [ !Ref 'EFSSecurityGroup' ]
+  MountTarget2:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId:
+        'Fn::ImportValue': !Sub '${VPCStackName}-PublicSubnet2'
+      SecurityGroups: [ !Ref 'EFSSecurityGroup' ]
+  MountTarget3:
+    Type: 'AWS::EFS::MountTarget'
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId:
+        'Fn::ImportValue': !Sub '${VPCStackName}-PublicSubnet3'
+      SecurityGroups: [ !Ref 'EFSSecurityGroup' ]
+
+  # 3) RDS MySQL
+  RDSDBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: MySQL custom config
+      Family: MySQL5.7
+      Parameters:
+        max_allowed_packet: 32505856
+  RDSDBSubnetGroup:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties:
+      DBSubnetGroupDescription: "Magento RDS subnet group"
+      SubnetIds:
+        - 'Fn::ImportValue': !Sub '${VPCStackName}-PublicSubnet1'
+        - 'Fn::ImportValue': !Sub '${VPCStackName}-PublicSubnet2'
+        - 'Fn::ImportValue': !Sub '${VPCStackName}-PublicSubnet3'
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBName: "magento"
+      Engine: MySQL
+      EngineVersion: "5.7"
+      MultiAZ: false
+      MasterUsername: "magento"
+      MasterUserPassword: !Ref 'MagentoDBPassword'
+      DBParameterGroupName: !Ref 'RDSDBParameterGroup'
+      DBInstanceClass: 'db.t2.medium'
+      AllocatedStorage: "20"
+      DBSubnetGroupName: !Ref 'RDSDBSubnetGroup'
+      DBSecurityGroups: [ !Ref 'RDSDBSecurityGroup' ]
+      VPCSecurityGroups: [ !Ref 'RDSSecurityGroup' ]
+
+  # 4) Redis / ElasticCache
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Group of subnets to place Redis into
+      SubnetIds:
+        - 'Fn::ImportValue': !Sub '${VPCStackName}-PublicSubnet1'
+        - 'Fn::ImportValue': !Sub '${VPCStackName}-PublicSubnet2'
+        - 'Fn::ImportValue': !Sub '${VPCStackName}-PublicSubnet3'
+  Redis:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      Engine: redis
+      CacheNodeType: cache.t2.small
+      NumCacheNodes: 1
+      CacheSubnetGroupName: !Ref 'RedisSubnetGroup'
+      VpcSecurityGroupIds:
+        - !GetAtt 'RedisSecurityGroup.GroupId'
+
+  # 5) Logs
+  LogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      RetentionInDays: !Ref LogsRetentionInDays
+      LogGroupName: !Ref LogGroupName
+
+# These are the values output by the CloudFormation template. Be careful
+# about changing any of them, because of them are exported with specific
+# names so that the other task related CF templates can use them.
+Outputs:
+  RDSAddress:
+    Description: The MySQL endpoint address
+    Value: !GetAtt DBInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-RDSAddress'
+  FileSystem:
+    Description: The EFS reference
+    Value: !Ref FileSystem
+    Export:
+      Name: !Sub '${AWS::StackName}-FileSystem'
+  LogGroup:
+    Description: Application log group
+    Value: !Ref LogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroup'
+  RedisEndpoint:
+    Description: The endpoint of the redis cluster
+    Value: !GetAtt 'Redis.RedisEndpoint.Address'
+    Export:
+      Name: !Sub '${AWS::StackName}-RedisEndpoint'
+  SmileShopContainersSG:
+    Description: The security group id that allow ec2 instance to reach EFS and RDS
+    Value: !GetAtt SmileShopContainersSecurityGroup.GroupId
+    Export:
+      Name: !Sub '${AWS::StackName}-SmileShopContainersSG'

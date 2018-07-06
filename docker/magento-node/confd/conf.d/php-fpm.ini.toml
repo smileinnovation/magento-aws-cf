@@ -1,0 +1,5 @@
+[template]
+src = "php-fpm.ini.tmpl"
+dest = "/usr/local/etc/php/conf.d/zz-magento.ini"
+owner = "magento"
+mode = "0644"

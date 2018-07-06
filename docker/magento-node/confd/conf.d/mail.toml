@@ -1,0 +1,5 @@
+[template]
+src = "mail.ini.tmpl"
+dest = "/usr/local/etc/php/conf.d/zz-mail.ini"
+owner = "magento"
+mode = "0644"

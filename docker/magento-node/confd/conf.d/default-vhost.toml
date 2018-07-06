@@ -1,0 +1,6 @@
+[template]
+src = "default-vhost.tmpl"
+dest = "/etc/nginx/conf.d/default.conf"
+owner = "magento"
+mode = "0644"
+check_cmd = "/usr/sbin/nginx -t"

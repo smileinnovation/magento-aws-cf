@@ -1,0 +1,5 @@
+[template]
+src = "php-fpm.conf.tmpl"
+dest = "/usr/local/etc/php-fpm.conf"
+owner = "magento"
+mode = "0644"
