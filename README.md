@@ -37,11 +37,11 @@ On my Mac, docker daemon was setup to use 6G of Ram and at least 2 CPU cores
    - as an example, put your magento project into ./docker/smileshop/src . For cronjob, same stuff but with ./docker/smileshop/cron
    - run :
 
-        # make smileshop
+         # make smileshop
 
    - to start it locally :
 
-        # docker-compose -f ./docker-compose-prod.yml up
+         # docker-compose -f ./docker-compose-prod.yml up
 
 ## 4) Delete stack and all volumes
 
