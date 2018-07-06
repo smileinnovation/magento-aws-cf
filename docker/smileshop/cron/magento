@@ -1,0 +1,1 @@
+* * * * * /usr/local/bin/php /var/www/magento/bin/magento cron:run > /dev/stdout 2> /dev/stderr
