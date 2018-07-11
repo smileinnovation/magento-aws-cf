@@ -231,6 +231,9 @@ Resources:
           # up the vm.max_map_count for elasticsearch
           echo vm.max_map_count=262144 >> /etc/sysctl.conf
           sysctl -w vm.max_map_count=262144
+          mkdir -p /ecs/esdata
+          chown 1000:1000 /ecs/esdata
+          chmod ug+rwx /ecs/esdata
           /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource ESAutoScalingGroup --region ${AWS::Region}
         -
           ECSCluster:
@@ -307,9 +310,9 @@ Resources:
               HardLimit: 65536
               Name: 'nofile'
               SoftLimit: 65536
-#          MountPoints:
-#            - ContainerPath: /usr/share/elasticsearch/data/
-#              SourceVolume: esdata
+          MountPoints:
+            - ContainerPath: /usr/share/elasticsearch/data/
+              SourceVolume: esdata
           LogConfiguration:
             LogDriver: 'awslogs'
             Options:
@@ -317,10 +320,10 @@ Resources:
                 'Fn::ImportValue': !Sub '${SmileShopDataStackName}-LogGroup'
               awslogs-region: !Ref 'AWS::Region'
               awslogs-stream-prefix: 'smileshop-es'
-#      Volumes:
-#        - Host:
-#            SourcePath: /ecs/esdata
-#          Name: esdata
+      Volumes:
+        - Host:
+            SourcePath: /ecs/esdata
+          Name: esdata
 
 Outputs:
   ElasticSearchEndPoint:
